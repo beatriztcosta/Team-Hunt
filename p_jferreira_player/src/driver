@@ -48,8 +48,8 @@ class Driver:
 
             theta = msg.angle_min + msg.angle_increment * idx
 
-            if theta>math.pi/2:
-                theta = min(theta - math.pi, 0) 
+            if theta>math.pi:
+                theta = min(theta - math.pi*2, 0) 
             
             if theta>=RANGE_MIN and theta<=RANGE_MAX:
                 idx = int( NUM_SENSORS*(theta-RANGE_MIN)/(RANGE_MAX-RANGE_MIN) )
@@ -60,9 +60,6 @@ class Driver:
             y = range * math.sin(theta)
             
 
-
-            print(f"distance: {range}, angle: {theta*180/math.pi}")
-            print(x,y)
         sensors = np.array(sensors)
         sensors = 10/(sensors+1e-5) 
         sensors[sensors<=.5] = 0
