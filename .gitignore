@@ -1,0 +1,13 @@
+*
+
+!*/
+
+!.gitignore
+!g16_bringup/**/*
+!g16_description/**/*
+!p_jferreira_player/**/*
+
+
+**/.vscode
+
+
