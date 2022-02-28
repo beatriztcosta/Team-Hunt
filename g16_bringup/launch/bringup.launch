@@ -2,6 +2,7 @@
     <!--Bloco 1: argumentos do launch file.-->
     <arg name="model" default="$(env TURTLEBOT3_MODEL)" doc="model type [burger, waffle, waffle_pi]"/>
     <arg name="visualize" default="true"/>
+    <arg name="smartdrive" default="false"/>
     <arg name="player_name" default="p_jferreira"/>
     <arg name="player_color" default="Red"/>
     <arg name="x_pos" default="-5.0"/>
@@ -23,14 +24,10 @@
         <arg name="y_pos" value="$(arg y_pos)"/>
         <arg name="z_pos" value="$(arg z_pos)"/>
     </include>
-    </group>
-
-    <group if="$(arg visualize)">
-        <!--Include do visualize.launch-->
-        <include file="$(find g16_bringup)/launch/visualize.launch">
-        </include>
-    </group>
-
+    </group>    
+    
+    
+    <node if="$(arg smartdrive)" pkg="g16_player" type="smartdriver" name="$(arg player_name)" respawn="true"/>
     
 
     <!-- Include do teleop.launch-->

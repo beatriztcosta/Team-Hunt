@@ -57,7 +57,7 @@ Visualization Manager:
       Value: true
     - Class: rviz/Image
       Enabled: true
-      Image Topic: /p_jferreira/camera/rgb/image_raw
+      Image Topic: /red1/camera/rgb/image_raw
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -90,7 +90,7 @@ Visualization Manager:
       Size (Pixels): 3
       Size (m): 0.10000000149011612
       Style: Flat Squares
-      Topic: /p_jferreira/scan
+      Topic: /red1/scan
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
@@ -157,8 +157,8 @@ Visualization Manager:
           Show Trail: false
           Value: true
       Name: RobotModel
-      Robot Description: p_jferreira/robot_description
-      TF Prefix: p_jferreira
+      Robot Description: red1/robot_description
+      TF Prefix: red1
       Update Interval: 0
       Value: true
       Visual Enabled: true
@@ -166,7 +166,7 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     Default Light: true
-    Fixed Frame: p_jferreira/odom
+    Fixed Frame: red1/odom
     Frame Rate: 30
   Name: root
   Tools:

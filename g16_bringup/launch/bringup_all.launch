@@ -1,0 +1,39 @@
+<launch>
+    <!--Bloco 1: argumentos do launch file.-->
+    <arg name="model" default="$(env TURTLEBOT3_MODEL)" doc="model type [burger, waffle, waffle_pi]"/>
+    <arg name="visualize" default="true"/>
+    
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="red1"/>
+        <arg name="player_color" value="Red"/>
+        <arg name="x_pos" value="2"/>
+        <arg name="y_pos" value="2"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="green1"/>
+        <arg name="player_color" value="Green"/>
+        <arg name="x_pos" value="-2"/>
+        <arg name="y_pos" value="2"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="blue1"/>
+        <arg name="player_color" value="Blue"/>
+        <arg name="x_pos" value="0"/>
+        <arg name="y_pos" value="0"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+
+    <group if="$(arg visualize)">
+        <!--Include do visualize.launch-->
+        <include file="$(find g16_bringup)/launch/visualize.launch">
+        </include>
+    </group>
+
+    <rosparam command="load" file="$(find g16_bringup)/params/game.yaml"/>
+
+</launch>

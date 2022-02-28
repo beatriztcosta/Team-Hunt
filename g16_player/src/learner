@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+import copy
+import math
+
+import rospy
+import tf2_ros
+from geometry_msgs.msg import Twist, PoseStamped
+import tf2_geometry_msgs  # **Do not use geometry_msgs. Use this instead for PoseStamped
+from sensor_msgs.msg import LaserScan
+from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
+
+from rospy import ServiceProxy
+
+import numpy as np
+import sys
+
+def delete_model(unique_name):
+   
+    srv = ServiceProxy('/gazebo/delete_model', DeleteModel)
+
+    req = DeleteModelRequest()
+
+    req.model_name = unique_name
+
+    resp = srv(req)
+
+    if resp.success:
+        print(resp.status_message, '(%s)' % unique_name)
+        return 0
+    else:
+        print("failed to delete model [%s]: %s" %
+              (unique_name, resp.status_message), file=sys.stderr)
+        return 1 
+
+def main():
+    # ---------------------------------------------------
+    # INITIALIZATION
+    # ---------------------------------------------------
+
+    
+
+    rospy.init_node('p_learner', anonymous=False)
+    for color in 'red', 'green', 'blue':
+        for i in range(1,4):
+            delete_model(f"{color}{i}")
+
+
+
+    # ---------------------------------------------------
+    # Execution
+    # ---------------------------------------------------
+    # while not rospy.is_shutdown():
+    #
+    #     # create a dog message to sent
+
+    # ---------------------------------------------------
+    # Termination
+    # ---------------------------------------------------
+
+
+if __name__ == '__main__':
+    main()
+
