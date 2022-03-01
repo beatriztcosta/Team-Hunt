@@ -7,6 +7,17 @@
   <gazebo reference="base_link">
     <material>Gazebo/DarkGrey</material>
     <material>Gazebo/${player_color}</material>
+    <sensor name="base_link" type="contact">
+      <update_rate>1000.0</update_rate>
+      <always_on>true</always_on>
+      <contact>
+        <collision>base_footprint_fixed_joint_lump__base_link_collision</collision>
+      </contact>
+      <plugin name="base_link_contact_sensor_plugin" filename="libgazebo_ros_bumper.so">
+        <bumperTopicName>contact</bumperTopicName>
+        <frameName>world</frameName>
+      </plugin>
+    </sensor>
   </gazebo>
 
   <gazebo reference="wheel_left_link">
@@ -150,7 +161,8 @@
       <always_on>true</always_on>
       <visualize>$(arg camera_visual)</visualize>
       <camera>
-          <horizontal_fov>1.085595</horizontal_fov>
+          <horizontal_fov>1.4</horizontal_fov>
+          <vertical_fov>1.0</vertical_fov>
           <image>
               <width>640</width>
               <height>480</height>
