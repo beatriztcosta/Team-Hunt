@@ -17,6 +17,7 @@ from matplotlib.pyplot import axis
 import rospy
 import tf2_ros
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from tf2_geometry_msgs import PoseStamped # **Do not use geometry_msgs. Use this instead for PoseStamped
 from sensor_msgs.msg import LaserScan, Image, CameraInfo
 from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
@@ -27,10 +28,11 @@ from rospy import ServiceProxy
 
 import numpy as np
 import os
-import argparse
 import rospy
 from geometry_msgs.msg import Twist
 import sys, select, os
+
+from driver import READY, Driver
 
 
 if os.name == 'nt':
@@ -54,42 +56,20 @@ ANG_VEL_STEP_SIZE = 0.3
 
 
 WAFFLE_WHEEL_DIST = 0.287
-
-NUM_SENSORS = 20
-RESOLUTION = 10
-
-
-RANGE_MIN = -150*math.pi/180 #-120 degrees
-RANGE_MAX = 150*math.pi/180 #120 degrees
-
-
-SAMPLES = 640/RESOLUTION
-HALF_SAMPLES = SAMPLES/2
-
-
-# binaries
-CAMERA_B, INPUTS_B, LASER_B = 0b001, 0b010, 0b100 
-READY = 0b111
+config = {
+    "NUM_SENSORS": 20,
+    "RESOLUTION": 10,
+    "RANGE_MIN": -150*math.pi/180,
+    "RANGE_MAX": 150*math.pi/180
+}
 
 # sizes
-INPUT_SIZE = RESOLUTION + NUM_SENSORS + 2 + 2
+INPUT_SIZE = config["RESOLUTION"] + config["NUM_SENSORS"] + 2 + 2
 HISTORY_SIZE = 4
 WEIGHT_SIZE = (1, INPUT_SIZE+1)
 
 
-
-
-def twistToDiff(speed, angular):
-    sl = (2*speed - angular*WAFFLE_WHEEL_DIST)/2
-    sr = angular*WAFFLE_WHEEL_DIST + sl
-    return [sr, sl]
-
-def diffToTwist(sr, sl):
-    return [(sr+sl)/2, (sr-sl)/WAFFLE_WHEEL_DIST]
-
-
 bridge = CvBridge()
-        
 
 class Normalizer():
 
@@ -160,154 +140,20 @@ def vels(target_linear_vel, target_angular_vel):
     return "Currently:\tlinear vel %s\t angular vel %s " % (target_linear_vel,target_angular_vel)
 
 
-class ManualDriver:
-
-    def __init__(self, name, team, normalizer):
-
-        self.goal = PoseStamped()
-        self.goal_active = False
-        self.team = team
-
-        self.sensors = []
-
-
-        self.normalizer = normalizer or Normalizer()
-        
-        self.speed = np.zeros((2,1))
-        
-        self.ready = 0b0
-
-        self.inputs = np.zeros((INPUT_SIZE,))
-
-        self.name = name #rospy.get_name()
-        print('My player name is ' + self.name)
-
-        self.publisher_command = rospy.Publisher( '/' + self.name + '/cmd_vel', Twist, queue_size=1)
-
-        self.tf_buffer = tf2_ros.Buffer()
-        self.listener = tf2_ros.TransformListener(self.tf_buffer)
-
-        self.goal_subscriber = rospy.Subscriber('/move_base_simple/goal', PoseStamped, self.goalReceivedCallback)
-        self.laser_subscriber = rospy.Subscriber(f"/{name}/scan", LaserScan, self.scanReceivedFallback)
-        self.camera_subscriber = rospy.Subscriber(f"/{name}/camera/rgb/image_raw", Image, self.imageReceivedFallback)
-        self.odom_subcriber = rospy.Subscriber(f"/{name}/odom", Odometry, self.odomReceivedFallback)
-        self.compressed_laser_pub = rospy.Publisher(f"/{name}/compressed_scan", LaserScan, queue_size=10)
-        self.camera_info = rospy.wait_for_message(f"/{name}/camera/rgb/camera_info", CameraInfo)
-
-    
-    def odomReceivedFallback(self, event):
-        twist = event.twist.twist
-        sr, sl = twistToDiff(twist.linear.x, twist.angular.z)
-        self.speed = np.array([sr,sl])
-        self.inputs[-4:] =  np.array([sr, sl, sr+sl, sr-sl])
-        self.ready |= INPUTS_B
-        
-
-    def imageReceivedFallback(self, image):
-       
-
-        image = bridge.imgmsg_to_cv2(image, desired_encoding='bgr8')
-
-        #cv2.imwrite("image.png", image)
-
-        teamtrackers = []
-        kernel = np.ones((2,2))
-        for color_idx in range(3):
-            values = [0]*RESOLUTION
-            lower = np.array([0,0,0]) 
-            upper = np.array([10,10,10])
-            lower[2-color_idx] = 90
-            upper[2-color_idx] = 120
-            mask = cv2.threshold(cv2.inRange(image, lower, upper), 128, 255, cv2.THRESH_BINARY)[1]
-            mask = cv2.erode(mask, kernel)
-            mask = cv2.dilate(mask, kernel)
-            #cv2.imshow("mask"+str(COLORS[color_idx]), mask)
-            mask = mask.sum(axis=0)/255
-            mask[mask<2] = 0
-            for i in range(640):
-                idxsmall = int((i-HALF_SAMPLES)/SAMPLES)
-                p = ((i-HALF_SAMPLES)%SAMPLES)/SAMPLES
-                if idxsmall>=0:
-                    modifier = 0.1+0.9*p
-                    values[idxsmall] += modifier*mask[i]
-                idxbig = idxsmall+1
-                if idxbig<RESOLUTION:
-                    modifier = 0.1+0.9*(1-p)
-                    values[idxbig] += modifier*mask[i]
-            values = np.array(values)/100
-            teamtrackers.append(values)
-        
-        self.inputs[:RESOLUTION] = teamtrackers[(self.team+1)%3] - teamtrackers[(self.team-1)%3]
-        if not (self.ready & CAMERA_B):
-            pass
-        self.ready |= CAMERA_B   
-        
-
-
-    
-    def scanReceivedFallback(self, msg):
-        
-        sensors = [math.inf]*NUM_SENSORS
-        for idx, dist in enumerate(msg.ranges):
-
-            if dist < 0.1 or dist==math.inf:
-                continue
-
-            theta = msg.angle_min + msg.angle_increment * idx
-
-            if theta>math.pi:
-                theta = min(theta - math.pi*2, 0) 
-            
-            if theta>=RANGE_MIN and theta<=RANGE_MAX:
-                idx = int( NUM_SENSORS*(theta-RANGE_MIN)/(RANGE_MAX-RANGE_MIN) )
-
-                sensors[idx] = min(dist, sensors[idx])
-
-
-        jumps = (RANGE_MAX-RANGE_MIN)/(NUM_SENSORS-1)
-        laserscan = LaserScan()
-        laserscan.header = msg.header
-        laserscan.angle_min = RANGE_MIN + jumps/2
-        laserscan.angle_max = RANGE_MAX - jumps/2
-        laserscan.angle_increment = jumps
-        laserscan.ranges = sensors
-        laserscan.range_min = min(sensors)
-        laserscan.range_max = max([s for s in sensors if s<math.inf]or[0])
-        laserscan.intensities = [0]*NUM_SENSORS
-        
-        self.compressed_laser_pub.publish(laserscan)
-
-        sensors = np.array(sensors).clip(max=100)
-        sensors = 10/(sensors+1) 
-        sensors[sensors<=.2] = 0
-
-        self.sensors = sensors
-        
-
-
-    def goalReceivedCallback(self, msg):
-        print('Received new goal on frame id' + msg.header.frame_id)
-        target_frame = self.name + '/odom'
-        try:
-
-            self.goal = self.tf_buffer.transform(msg, target_frame, rospy.Duration(1))
-            self.goal_active = True
-            rospy.logwarn('Setting new goal')
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
-            self.goal_active = False
-            rospy.logerr('Could not transform goal from ' + msg.header.frame_id + ' to ' + target_frame + '. Will ignore this goal.')
-
+class ManualDriver(Driver):
+    def __init__(self, name, team, normalizer, input_params):
+        super().__init__(name, team, normalizer, input_params)
 
     def driveStraight(self, minumum_speed=0.1, maximum_speed=1.5):
         goal_copy = copy.deepcopy(self.goal)  # make sure we don't change the stamp field of the goal
         goal_copy.header.stamp = rospy.Time.now()
 
-        print('Transforming pose')
         goal_in_base_link = self.tf_buffer.transform(goal_copy, self.name + '/base_footprint', rospy.Duration(1))
-        print('Pose trasnformed')
 
         x = goal_in_base_link.pose.position.x
         y = goal_in_base_link.pose.position.y
+
+        NUM_SENSORS = self.input_params["NUM_SENSORS"]
 
         self.angle = math.atan2(y,x)
         distance_to_goal = math.sqrt(x**2 + y**2)
@@ -317,14 +163,16 @@ class ManualDriver:
         elif abs(self.angle)<math.pi/2:    
             self.speed = max(minumum_speed, 0.5 * distance_to_goal)   # limit minimum speed
             self.speed = min(maximum_speed, self.speed)   # limit maximum speed
+            # reduce speed relative to the required angle
+            self.speed *= 1/(1+abs(self.angle)/(math.pi/4) ) 
         else:
-            self.speed = 0
+            self.speed = 0  # rotate in place
 
         if distance_to_goal < 0.1:
             self.goal_active = False
 
-    def sendCommandCallback(self):
-        print('Sending twist command')        
+
+    def sendCommandCallback(self): 
         self.driveStraight()
 
         twist = Twist()
@@ -402,7 +250,7 @@ if __name__=="__main__":
     p = 'red1'
     myteamidx = max([idx for idx, n in enumerate(COLORS) if p.startswith(n)] or [0])
 
-    driver = ManualDriver(p, myteamidx, Normalizer())
+    driver = ManualDriver(p, myteamidx, None, config)
     lastKey = None 
     keys_pressed = set()
 
@@ -426,7 +274,7 @@ if __name__=="__main__":
             if (key_pressed == '\x03'):
                 sys.exit(1)
                 break
-            if driver.ready & 0x111:
+            if driver.ready == READY:
                 actions = np.array([int(key in keys_pressed) for key in 'wsad '])
                 queue = np.concatenate( [ queue[INPUT_SIZE:] , driver.inputs ] )
                 for key in 'wsad iop':

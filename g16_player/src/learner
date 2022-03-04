@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
-import copy
-import math
 
 import rospy
 import tf2_ros
 from geometry_msgs.msg import Twist, PoseStamped
-import tf2_geometry_msgs  # **Do not use geometry_msgs. Use this instead for PoseStamped
 from sensor_msgs.msg import LaserScan, Image, CameraInfo
 from nav_msgs.msg import Odometry
+from gazebo_msgs.msg import ModelState, ModelStates, ContactsState
 from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
 
-import math, random
+import math
+import random
 import subprocess
 from colorama import Fore, Back, Style
-from copy import copy
 
-import pandas
-from functools import partial
 import rospy
 import tf_conversions  # Because of transformations
 import tf2_ros
-import geometry_msgs.msg
-from gazebo_msgs.msg import ModelState, ModelStates, ContactsState
 from prettytable import PrettyTable
 from rospy import ServiceProxy
 from cv_bridge import CvBridge
@@ -36,6 +30,8 @@ import numpy as np
 from gazebo_msgs.srv import SetModelState
 
 
+from driver import Driver, Normalizer
+
 COLORS = ['red', 'green', 'blue']
 PLAYERS = [[color+str(j) for j in range(1,4)] for color in COLORS] 
 RGB = [(255,0,0), (0,255,0), (0,0,255)]
@@ -46,16 +42,13 @@ WAFFLE_MAX_ANG_VEL = 1.82
 
 WAFFLE_WHEEL_DIST = 0.287
 
-NUM_SENSORS = 11
-RESOLUTION = 7
 
-
-RANGE_MIN = -120*math.pi/180 #-120 degrees
-RANGE_MAX = 120*math.pi/180 #120 degrees
-
-
-SAMPLES = 640/RESOLUTION
-HALF_SAMPLES = SAMPLES/2
+config = {
+    "NUM_SENSORS": 11,
+    "RESOLUTION": 7,
+    "RANGE_MIN": -120*math.pi/180,
+    "RANGE_MAX": 120*math.pi/180,
+}
 
 
 # binaries
@@ -64,14 +57,13 @@ READY = 0b111
 
 ## learning parameters
 # ARS hyperparameters
-DIRECTIONS = 5
+DIRECTIONS = 4
 BEST_DIRECTIONS = 16
-NOISE_MIN = 0.02
+NOISE_MIN = 0.03
 NOISE_MAX = 0.04
-LEARNING_RATE = 0.5
+LEARNING_RATE = 0.3
 # sizes
-INPUT_SIZE = RESOLUTION + NUM_SENSORS + 2 + 2
-WEIGHT_SIZE = (1, INPUT_SIZE+1)
+
 
 def delete_model(unique_name):
    
@@ -121,30 +113,28 @@ def diffToTwist(sr, sl):
 bridge = CvBridge()
 
 class MultiBrain():
-    def __init__(self):
+    def __init__(self, input_params):
+        self.input_params = input_params
         self.learners = []
         self.n = 0
         self.pointer = 0
-        self.currentWeights = np.zeros(WEIGHT_SIZE)
-        self.currentWeights[0,-1] = 0.3
-        self.currentWeights[0, :RESOLUTION] = np.linspace(0.2, -0.2, RESOLUTION)
-        self.currentWeights[0, RESOLUTION+NUM_SENSORS:RESOLUTION+NUM_SENSORS+3] = np.array([-0.0, 0.05, -0.2])
-        #self.currentWeights[0, RESOLUTION:RESOLUTION+NUM_SENSORS] = np.linspace(0.0, 0.1, NUM_SENSORS)
-        #self.currentWeights = np.array([[0.2039244, 0.14529148,0.06503365,0.01212244,-0.06979054,-0.13069589
-        #    ,-0.19038191,-0.01546823,0.00651391,0.00478352,0.01165758,-0.00090158
-        #    , 0.01215455,-0.01241391,-0.0009678,-0.00395642,0.00866256,-0.01193278
-        #    , 0.00490993,0.05815916,-0.17542923,-0.00469125,0.31233682
-        #]])
-        self.currentWeights = np.array([[0.21431054160078758, 0.16167016546095872, 0.07045850832304099, 0.2216216024295199, -0.04101398275982003, -0.14661356993134747, -0.19469888892158788, -0.05280327129006949, 0.029113533602275685, 0.08365593820625683, 0.028318066009373005, -0.020178627757014754, -0.09543855134520472, -0.18230661666626066, -0.10320936072496668, -0.07974540611498637, 0.032630653640017854, 0.030378132808802194, -0.061106268574196855, 0.06754621438402827, -0.18978097900455224, -0.03385914291000995, 0.3080008059517819]])
+        input_size = input_params["RESOLUTION"] + input_params["NUM_SENSORS"] + 2 + 2
+        self.weight_size = (1, input_size+1)
+        self.currentWeights = np.zeros(self.weight_size)
+        #self.currentWeights = np.array([[0.20061477035763844, 0.14324957959222312, 0.08152130281630943, 0.010761835907539187, -0.07438897441919387, -0.11763353425630188, -0.19910974231305306, -0.01852985871130197, 0.0031106606227670037, 0.007326302152042701, 0.01448675556642779, 0.009614205473124842, 0.024778952208224295, -0.022149656796659326, 0.002687257345506941, -0.018275314376151017, 0.002858643072713834, 0.00726029609060885, 0.0008829157167317709, 0.052903745736976246, -0.16822792904581405, -0.006246236178042087, 0.3116772461598515]])
+        self.currentWeights = np.array([[0.2039244, 0.14529148,0.06503365,0.01212244,-0.06979054,-0.13069589
+            ,-0.19038191,-0.01546823,0.00651391,0.00478352,0.01165758,-0.00090158
+            , 0.01215455,-0.01241391,-0.0009678,-0.00395642,0.00866256,-0.01193278
+            , 0.00490993,0.05815916,-0.17542923,-0.00469125,0.31233682
+        ]])
+        #self.currentWeights = np.array([[0.21431054160078758, 0.16167016546095872, 0.07045850832304099, 0.2216216024295199, -0.04101398275982003, -0.14661356993134747, -0.19469888892158788, -0.05280327129006949, 0.029113533602275685, 0.08365593820625683, 0.028318066009373005, -0.020178627757014754, -0.09543855134520472, -0.18230661666626066, -0.10320936072496668, -0.07974540611498637, 0.032630653640017854, 0.030378132808802194, -0.061106268574196855, 0.06754621438402827, -0.18978097900455224, -0.03385914291000995, 0.3080008059517819]])
     def addLearner(self, learner):
         self.learners.append( learner )
         self.n += 1
-        
         self.rewards = np.zeros((DIRECTIONS*2*self.n,))
-        self.weightNoise = np.zeros((DIRECTIONS*2*self.n,)+WEIGHT_SIZE)
+        self.weightNoise = np.zeros((DIRECTIONS*2*self.n,)+self.weight_size)
 
     def update(self, rewards, weightNoise):
-        print("updating!!", self.weightNoise.shape)
         self.rewards[self.pointer*DIRECTIONS*2:(self.pointer+1)*DIRECTIONS*2] = rewards[:]
         self.weightNoise[self.pointer*DIRECTIONS*2:(self.pointer+1)*DIRECTIONS*2,:,:] = weightNoise[:,:,:]
         self.pointer += 1
@@ -176,225 +166,19 @@ class MultiBrain():
 
         
 
-class Normalizer():
-
-    def __init__(self):
-        self.n = 0
-        self.min = np.ones(INPUT_SIZE)*1000
-        self.max = np.ones(INPUT_SIZE)*-1000
-
-    def observe(self, x):
-        self.n += 1.
-        self.min = np.minimum(self.min, x)
-        self.max = np.maximum(self.max, x)
-
-    def normalize(self, inputs):
-        return inputs/np.abs(self.max.clip(min=1e-2))
-
-
 def shuffle_along_axis(a, axis):
     idx = np.random.rand(*a.shape).argsort(axis=axis)
     return np.take_along_axis(a,idx,axis=axis)
 
-class Driver:
-
-    def __init__(self, name, team, weights, normalizer):
-
-        self.goal = PoseStamped()
-        self.goal_active = False
-        self.team = team
-
-        
-        self.normalizer = normalizer or Normalizer()
-        
-        self.speed = np.zeros((2,1))
-        
-        self.ready = 0b0
-
-        self.inputs = np.zeros((INPUT_SIZE,))
-        self.weights = weights 
-
-        self.name = name #rospy.get_name()
-        print('My player name is ' + self.name)
-
-        self.publisher_command = rospy.Publisher( '/' + self.name + '/cmd_vel', Twist, queue_size=1)
-
-        self.tf_buffer = tf2_ros.Buffer()
-        self.listener = tf2_ros.TransformListener(self.tf_buffer)
-
-        self.compressed_laser_pub = rospy.Publisher(f"/{name}/compressed_scan", LaserScan, queue_size=10)
-        self.goal_subscriber = rospy.Subscriber('/move_base_simple/goal', PoseStamped, self.goalReceivedCallback)
-        self.laser_subscriber = rospy.Subscriber(f"/{name}/scan", LaserScan, self.scanReceivedFallback)
-        self.camera_subscriber = rospy.Subscriber(f"/{name}/camera/rgb/image_raw", Image, self.imageReceivedFallback)
-        self.odom_subcriber = rospy.Subscriber(f"/{name}/odom", Odometry, self.odomReceivedFallback)
-        self.camera_info = rospy.wait_for_message(f"/{name}/camera/rgb/camera_info", CameraInfo)
-
-    def debug(self, *args):
-        #if self.name=='red1':
-        #    print(*args)
-        pass
-    def odomReceivedFallback(self, event):
-        twist = event.twist.twist
-        #print(twist)
-        sr, sl = twistToDiff(twist.linear.x, twist.angular.z)
-        self.speed = np.array([sr,sl])
-        if not (self.ready & INPUTS_B):
-            pass
-            #print(self.name, "twist: ", twist.linear.x, twist.angular.z)
-            #print(self.name, "sr, sl: ", sr, sl)
-        self.inputs[-4:] =  np.array([sr, sl, sr+sl, sr-sl])
-        self.ready |= INPUTS_B
-        self.act()
-
-    def act(self):
-
-        if not (self.ready & 0x111) or self.name=='red1':
-            return
-        
-        self.normalizer.observe(self.inputs)
-        self.debug("inputs:", self.inputs)
-        I = self.inputs
-        symetric_inputs = np.concatenate( [I[:RESOLUTION][::-1], I[RESOLUTION:RESOLUTION+NUM_SENSORS][::-1], I[-4:-2][::-1], I[-2:-1], -I[-1:] ] )  
-        #print(self.name, "symetric_inputs:", symetric_inputs)
-        compound_inputs_r = np.concatenate([self.normalizer.normalize(self.inputs), np.ones((1,))])
-        compound_inputs_l = np.concatenate([self.normalizer.normalize(symetric_inputs), np.ones((1,))])
-        #print(self.inputs, compound_inputs_r)
-
-        self.ready = 0b0 #reset ready state
-
-        actionr = np.tanh( self.weights.dot(compound_inputs_r) ) * WAFFLE_MAX_LIN_VEL #values between -1 and 1
-        actionl = np.tanh( self.weights.dot(compound_inputs_l) ) * WAFFLE_MAX_LIN_VEL 
-       
-        self.debug("actionr, actionl: ", actionr, actionl)
-        sp_linear, sp_angular = diffToTwist( (actionr[0] + self.speed[0])/2, (actionl[0] + self.speed[1])/2 )
-        self.debug("sp_linear, sp_angular: ", sp_linear, sp_angular)
-        twist = Twist()
-        twist.linear.x = 0#sp_linear
-        twist.angular.z = 0#sp_angular 
-        self.publisher_command.publish(twist)
-
-    def imageReceivedFallback(self, image):
-       
-
-        image = bridge.imgmsg_to_cv2(image, desired_encoding='bgr8')
-
-        #cv2.imwrite("image.png", image)
-
-        lower = np.array([0,0,0]) 
-        upper = np.array([15,15,15]) 
-        cars = cv2.threshold(cv2.inRange(image, lower, upper), 128, 255, cv2.THRESH_BINARY)[1]
-        #cv2.imshow("cars", cars)
-
-        teamtrackers = []
-        kernel = np.ones((2,2))
-        for color_idx in range(3):
-            values = [0]*RESOLUTION
-            lower = np.array([0,0,0]) 
-            upper = np.array([10,10,10])
-            lower[2-color_idx] = 90
-            upper[2-color_idx] = 120
-            mask = cv2.threshold(cv2.inRange(image, lower, upper), 128, 255, cv2.THRESH_BINARY)[1]
-            mask = cv2.erode(mask, kernel)
-            mask = cv2.dilate(mask, kernel)
-            #cv2.imshow("mask"+str(COLORS[color_idx]), mask)
-            mask = mask.sum(axis=0)/255
-            mask[mask<2] = 0
-            for i in range(640):
-                idxsmall = int((i-HALF_SAMPLES)/SAMPLES)
-                p = ((i-HALF_SAMPLES)%SAMPLES)/SAMPLES
-                if idxsmall>=0:
-                    modifier = 0.1+0.9*p
-                    values[idxsmall] += modifier*mask[i]
-                idxbig = idxsmall+1
-                if idxbig<RESOLUTION:
-                    modifier = 0.1+0.9*(1-p)
-                    values[idxbig] += modifier*mask[i]
-            values = np.array(values)/100
-            teamtrackers.append(values)
-        
-        #cv2.waitKey(2)
-        
-        self.debug(teamtrackers[(self.team+1)%3] - teamtrackers[(self.team-1)%3])
-        self.inputs[:RESOLUTION] = teamtrackers[(self.team+1)%3] - teamtrackers[(self.team-1)%3]#, teamtrackers[self.team]], axis=0)
-        if not (self.ready & CAMERA_B):
-            #print(self.name, self.inputs[:RESOLUTION])
-            pass
-        self.ready |= CAMERA_B  
-        self.act()
-
-
-    def scanReceivedFallback(self, msg):
-        
-        
-        sensors = [math.inf]*NUM_SENSORS
-        for idx, dist in enumerate(msg.ranges):
-
-            if dist < 0.1 or dist==math.inf:
-                continue
-
-            theta = msg.angle_min + msg.angle_increment * idx
-
-            if theta>math.pi:
-                theta = min(theta - math.pi*2, 0) 
-            
-            if theta>=RANGE_MIN and theta<=RANGE_MAX:
-                idx = int( NUM_SENSORS*(theta-RANGE_MIN)/(RANGE_MAX-RANGE_MIN) )
-
-                sensors[idx] = min(dist, sensors[idx])
-
-        if self.name=="red1":
-            jumps = (RANGE_MAX-RANGE_MIN)/(NUM_SENSORS-1)
-            laserscan = LaserScan()
-            laserscan.header = msg.header
-            laserscan.angle_min = RANGE_MIN + jumps/2
-            laserscan.angle_max = RANGE_MAX - jumps/2
-            laserscan.angle_increment = jumps
-            laserscan.ranges = sensors
-            laserscan.range_min = min(sensors)
-            laserscan.range_max = max([s for s in sensors if s<math.inf]or[0])
-            laserscan.intensities = [0]*NUM_SENSORS
-            
-            self.compressed_laser_pub.publish(laserscan)
-
-        sensors = np.array(sensors).clip(max=100)
-        sensors = 10/(sensors+1) 
-        sensors[sensors<=.2] = 0
-
-        self.sensors = sensors
-        
-        
-        self.inputs[RESOLUTION:RESOLUTION+NUM_SENSORS] = sensors
-        self.ready |= LASER_B
-        self.act()
-
-
-    def goalReceivedCallback(self, msg):
-        # TODO verify is goal is on odom frame
-        print('Received new goal on frame id' + msg.header.frame_id)
-        target_frame = self.name + '/odom'
-        try:
-
-            self.goal = self.tf_buffer.transform(msg, target_frame, rospy.Duration(1))
-            self.goal_active = True
-            rospy.logwarn('Setting new goal')
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
-            goal_active = False
-            rospy.logerr('Could not transform goal from ' + msg.header.frame_id + ' to ' + target_frame + '. Will ignore this goal.')
-
-        # print('Received new goal')
-        # self.goal = copy.copy(msg)  # store goal
-        # self.goal = copy.copy(msg)  # store goal
-        # self.goal_active = True
 
 class Learner(Driver):
-    def __init__(self, name, team, weights, normalizer, brain=None):
+    def __init__(self, name, team, weights, normalizer, input_params, brain=None):
+        input_size = input_params["RESOLUTION"] + input_params["NUM_SENSORS"] + 2 + 2
+        self.weight_size = (1, input_size+1)
         if weights:
             self.currentWeights = weights
         else:
-            self.currentWeights = np.zeros(WEIGHT_SIZE)
-            #self.currentWeights[0,-1] = 0.5
-            #self.currentWeights[0, :RESOLUTION] = np.linspace(0.5, 0.0, RESOLUTION)
-            #self.currentWeights[0, RESOLUTION:RESOLUTION+NUM_SENSORS] = np.linspace(0.0, 0.5, NUM_SENSORS)
+            self.currentWeights = np.zeros(self.weight_size)
 
         if brain:
             brain.addLearner(self)
@@ -403,11 +187,11 @@ class Learner(Driver):
         self.name = name
         self.brain = brain
         self.rewards = np.zeros((DIRECTIONS*2,))
-        self.weightNoise = np.zeros((DIRECTIONS*2,)+WEIGHT_SIZE)
+        self.weightNoise = np.zeros((DIRECTIONS*2,)+self.weight_size)
         self.currentIdx = 0
         self.generateNoise()
-        super().__init__(name, team, self.currentWeights + self.weightNoise[0, :, :], normalizer)
-
+        self.weights = self.currentWeights + self.weightNoise[0, :, :]
+        super().__init__(name, team, normalizer, input_params)
 
 
     def endEpisode(self, reward):
@@ -440,7 +224,6 @@ class Learner(Driver):
             step += self.weightNoise[idx*2,:,:]*(self.rewards[idx*2] - self.rewards[idx*2+1])*G
             G*=0.95
 
-        print(f"BEFORE {self.name}: ", self.currentWeights)
         self.currentWeights += LEARNING_RATE / max(sigma, 0.01) * step
         print(f"AFTER {self.name}: ", self.currentWeights)
 
@@ -450,18 +233,49 @@ class Learner(Driver):
         self.currentIdx = 0
         noise = np.random.randn(DIRECTIONS, *self.weightNoise.shape[1:])
 
-        noiseAmplify = np.linspace(NOISE_MIN, NOISE_MAX, DIRECTIONS)
+        noiseAmplify = np.zeros((DIRECTIONS,)) if rospy.get_param('/disable_learning') else np.linspace(NOISE_MIN, NOISE_MAX, DIRECTIONS)
         np.random.shuffle(noiseAmplify)
 
         for d in range(DIRECTIONS):
             self.weightNoise[d*2,:,:] = noise[d,:,:]*noiseAmplify[d]
             self.weightNoise[d*2+1,:,:] = -noise[d,:,:]*noiseAmplify[d]
 
-        self.debug(self.weightNoise)
+      
         self.weights = self.currentWeights + self.weightNoise[self.currentIdx, :, :]
   
+    def act(self):
 
-class Referee:
+        if self.ready != READY:
+            return
+        
+        RESOLUTION = self.input_params["RESOLUTION"]
+        NUM_SENSORS = self.input_params["NUM_SENSORS"]
+
+        self.normalizer.observe(self.inputs)
+        I = self.inputs
+        symetric_inputs = np.concatenate( [I[:RESOLUTION][::-1], I[RESOLUTION:RESOLUTION+NUM_SENSORS][::-1], I[-4:-2][::-1], I[-2:-1], -I[-1:] ] )  
+        
+        compound_inputs_r = np.concatenate([self.normalizer.normalize(self.inputs), np.ones((1,))])
+        compound_inputs_l = np.concatenate([self.normalizer.normalize(symetric_inputs), np.ones((1,))])
+
+        self.ready = 0b0 #reset ready state
+
+        actionr = np.tanh( self.weights.dot(compound_inputs_r) ) * WAFFLE_MAX_LIN_VEL #values between -1 and 1
+        actionl = np.tanh( self.weights.dot(compound_inputs_l) ) * WAFFLE_MAX_LIN_VEL 
+        
+        if self.sensors[NUM_SENSORS//2]>5 and self.inputs[RESOLUTION//2-1:RESOLUTION//2+2].sum()<=0.0:
+            sp_linear, sp_angular = diffToTwist( -1, -1.5 )
+        else:
+            sp_linear, sp_angular = diffToTwist( (actionr[0] + self.speed[0])/2, (actionl[0] + self.speed[1])/2 )
+        twist = Twist()
+        twist.linear.x = sp_linear
+        twist.angular.z = sp_angular 
+        self.publisher_command.publish(twist)
+
+
+
+
+class Teacher:
 
     def __init__(self, learners):
 
@@ -490,6 +304,7 @@ class Referee:
                        'negative_score': rospy.get_param('/negative_score'),
                        'best_hunter_score': rospy.get_param('/best_hunter_score'),
                        'best_survivor_score': rospy.get_param('/best_survivor_score'),
+                       'disable_learning': rospy.get_param('/disable_learning'),
                        'red': rospy.get_param('/red_players'),
                        'green': rospy.get_param('/green_players'),
                        'blue': rospy.get_param('/blue_players')}
@@ -627,8 +442,6 @@ class Referee:
         if prey_values.count(minimum_num_preyed) > 1:
             best_survivor = None
 
-        # print('best hunter is ' + str(best_hunter))
-        # print('best survivor is ' + str(best_survivor))
         return best_hunter, best_survivor
 
     def callbackCheckGame(self, event):
@@ -639,18 +452,13 @@ class Referee:
         now = rospy.Time.now()
         for learner in self.learners:
             player = self.players[learner.name]
-            #print(player.killed, learner.inputs[-2])
             if not player.killed:
-                player.score += max(0, abs(learner.speed.sum()) )/30.0
+                pass
+                ##player.score += max(0, abs(learner.speed.sum()) )/30.0
             elif (now - player.stamp_killed).to_sec() > self.params['killed_duration']:
                 player.stamp_resuscitated = rospy.Time.now()
                 self.movePlayerToArena(learner.name)
                 rospy.logwarn("Resuscitating %s", learner.name)
-
-
-                
-        # Print scoreboard
-        #self.printScores()
 
     def callbackHuntedEvent(self, hunter, prey):
         if self.game_over:
@@ -668,10 +476,8 @@ class Referee:
                 return
             self.players[hunter].num_hunted += 1
             self.players[prey].num_preyed += 1
-            #self.score[self.players[hunter].my_team] += self.params['positive_score']
             self.players[hunter].score += self.params['positive_score']
             self.players[prey].score += self.params['negative_score']
-            #self.score[self.players[prey].my_team] += self.params['negative_score']
 
     def killPlayer(self, name, modify_score=0):
         self.players[name].killed = True
@@ -725,7 +531,7 @@ class PlayerInfo:
        
 
 
-        print('Referee configuring ' + self.name + ', from team ' + self.my_team + ', hunting ' + str(
+        print('Teacher configuring ' + self.name + ', from team ' + self.my_team + ', hunting ' + str(
             self.players[self.prey_team]) + ' and fleeing from ' + str(self.players[self.hunter_team]))
 
         self.callbackHuntedEvent = callbackHuntedEvent
@@ -743,14 +549,10 @@ class PlayerInfo:
 
     def reset(self):
         self.score = 0
-        #self.killed = False
-        #self.stamp_resuscitated = rospy.Time.now()
-        #self.stamp_killed = rospy.Time.now() - rospy.Duration.from_sec(10)
         self.num_hunted = 0
         self.num_preyed = 0
 
     def callbackContactReceived(self, msg):
-        # print(self.colorama_color + self.name + Style.RESET_ALL + ': contact message received')
         now = rospy.Time.now()
         for state in msg.states:
 
@@ -764,7 +566,7 @@ class PlayerInfo:
             if object2 in self.players[self.prey_team]:
                 self.callbackHuntedEvent(self.name, object2)
            
-            elif collision_obj2.startswith("Wall") or object2 in self.players[self.my_team]: #:
+            elif collision_obj2.startswith("Wall") or object2 in self.players[self.my_team] and not self.params["disable_learning"]:
                 if (now - self.stamp_resuscitated).to_sec() > 2 and collision_obj2.startswith("Wall"): #immunity diration
                     rospy.logwarn(self.name + ' bumped into a wall ')
                     self.killPlayer(self.name, -2)
@@ -786,16 +588,16 @@ def main():
     rospy.init_node('p_learner', anonymous=True)  # initialize the ros node
     #deleteAllModels()
     #return
-    normalizer = Normalizer()
+    normalizer = Normalizer(config["RESOLUTION"] + config["NUM_SENSORS"] + 2 + 2)
     rospy.sleep(0.5)  # make sure the rospy time works
     learners = []
-    brain = MultiBrain() # {team: MultiBrain() for team in ['red', 'green', 'blue']}
+    brain = MultiBrain(config) # {team: MultiBrain() for team in ['red', 'green', 'blue']}
     for color in 'red', 'green', 'blue':
         for p in rospy.get_param(f"/{color}_players"):
             myteamidx = max([idx for idx, n in enumerate(COLORS) if p.startswith(n)] or [0])
-            learners.append( Learner(p, myteamidx, None, normalizer, brain) )
+            learners.append( Learner(p, myteamidx, None, normalizer, config, brain) )
             #delete_model(p)
-    referee = Referee(learners)
+    teacher = Teacher(learners)
 
     rospy.spin()
 
