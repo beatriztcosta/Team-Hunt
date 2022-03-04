@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+#!/usr/bin/env python3
+#!/usr/bin/env python3
+import copy
+import math
+
+import rospy
+import tf2_ros
+from geometry_msgs.msg import Twist, PoseStamped
+import tf2_geometry_msgs  # **Do not use geometry_msgs. Use this instead for PoseStamped
+from sensor_msgs.msg import LaserScan, Image, CameraInfo
+from nav_msgs.msg import Odometry
+from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
+
+from matplotlib.pyplot import axis
+
+import rospy
+import tf2_ros
+from geometry_msgs.msg import Twist
+from tf2_geometry_msgs import PoseStamped # **Do not use geometry_msgs. Use this instead for PoseStamped
+from sensor_msgs.msg import LaserScan, Image, CameraInfo
+from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
+import cv2
+import numpy as np
+from cv_bridge import CvBridge
+from rospy import ServiceProxy
+
+import numpy as np
+import os
+import argparse
+import rospy
+from geometry_msgs.msg import Twist
+import sys, select, os
+
+
+if os.name == 'nt':
+  import msvcrt
+else:
+  import tty, termios
+
+
+
+COLORS = ['red', 'green', 'blue']
+PLAYERS = [[color+str(j) for j in range(1,4)] for color in COLORS] 
+RGB = [(255,0,0), (0,255,0), (0,0,255)]
+
+
+
+
+WAFFLE_MAX_LIN_VEL = 5.26
+WAFFLE_MAX_ANG_VEL = 1.82
+LIN_VEL_STEP_SIZE = 0.1
+ANG_VEL_STEP_SIZE = 0.3
+
+
+WAFFLE_WHEEL_DIST = 0.287
+
+NUM_SENSORS = 20
+RESOLUTION = 10
+
+
+RANGE_MIN = -150*math.pi/180 #-120 degrees
+RANGE_MAX = 150*math.pi/180 #120 degrees
+
+
+SAMPLES = 640/RESOLUTION
+HALF_SAMPLES = SAMPLES/2
+
+
+# binaries
+CAMERA_B, INPUTS_B, LASER_B = 0b001, 0b010, 0b100 
+READY = 0b111
+
+# sizes
+INPUT_SIZE = RESOLUTION + NUM_SENSORS + 2 + 2
+HISTORY_SIZE = 4
+WEIGHT_SIZE = (1, INPUT_SIZE+1)
+
+
+
+
+def twistToDiff(speed, angular):
+    sl = (2*speed - angular*WAFFLE_WHEEL_DIST)/2
+    sr = angular*WAFFLE_WHEEL_DIST + sl
+    return [sr, sl]
+
+def diffToTwist(sr, sl):
+    return [(sr+sl)/2, (sr-sl)/WAFFLE_WHEEL_DIST]
+
+
+bridge = CvBridge()
+        
+
+class Normalizer():
+
+    def __init__(self):
+        self.n = 0
+        self.min = np.ones(INPUT_SIZE)*1000
+        self.max = np.ones(INPUT_SIZE)*-1000
+
+    def observe(self, x):
+        self.n += 1.
+        self.min = np.minimum(self.min, x)
+        self.max = np.maximum(self.max, x)
+
+    def normalize(self, inputs):
+        return inputs/np.abs(self.max.clip(min=1e-2))
+
+    def saveFromFile(self, file):
+        np.savez(file, {
+            "min": self.min,
+            "max": self.max,
+            "n": self.n
+        })
+
+    def loadFromFile(self, file):
+        dc = np.load(file)
+        self.n = dc["n"] 
+        self.min = dc["min"] 
+        self.max = dc["max"] 
+
+def shuffle_along_axis(a, axis):
+    idx = np.random.rand(*a.shape).argsort(axis=axis)
+    return np.take_along_axis(a,idx,axis=axis)
+
+
+def constrain(input, low, high):
+    if input < low:
+      input = low
+    elif input > high:
+      input = high
+    else:
+      input = input
+
+    return input
+
+def checkLimitVelocity(vel, value):
+    
+    return constrain(vel, -value, value)
+
+
+def getKey():
+    if os.name == 'nt':
+      if sys.version_info[0] >= 3:
+        return msvcrt.getch().decode()
+      else:
+        return msvcrt.getch()
+
+    tty.setraw(sys.stdin.fileno())
+    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+    if rlist:
+        key = sys.stdin.read(1)
+    else:
+        key = ''
+
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+    return key
+
+def vels(target_linear_vel, target_angular_vel):
+    return "Currently:\tlinear vel %s\t angular vel %s " % (target_linear_vel,target_angular_vel)
+
+
+class ManualDriver:
+
+    def __init__(self, name, team, normalizer):
+
+        self.goal = PoseStamped()
+        self.goal_active = False
+        self.team = team
+
+        self.sensors = []
+
+
+        self.normalizer = normalizer or Normalizer()
+        
+        self.speed = np.zeros((2,1))
+        
+        self.ready = 0b0
+
+        self.inputs = np.zeros((INPUT_SIZE,))
+
+        self.name = name #rospy.get_name()
+        print('My player name is ' + self.name)
+
+        self.publisher_command = rospy.Publisher( '/' + self.name + '/cmd_vel', Twist, queue_size=1)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        self.goal_subscriber = rospy.Subscriber('/move_base_simple/goal', PoseStamped, self.goalReceivedCallback)
+        self.laser_subscriber = rospy.Subscriber(f"/{name}/scan", LaserScan, self.scanReceivedFallback)
+        self.camera_subscriber = rospy.Subscriber(f"/{name}/camera/rgb/image_raw", Image, self.imageReceivedFallback)
+        self.odom_subcriber = rospy.Subscriber(f"/{name}/odom", Odometry, self.odomReceivedFallback)
+        self.compressed_laser_pub = rospy.Publisher(f"/{name}/compressed_scan", LaserScan, queue_size=10)
+        self.camera_info = rospy.wait_for_message(f"/{name}/camera/rgb/camera_info", CameraInfo)
+
+    
+    def odomReceivedFallback(self, event):
+        twist = event.twist.twist
+        sr, sl = twistToDiff(twist.linear.x, twist.angular.z)
+        self.speed = np.array([sr,sl])
+        self.inputs[-4:] =  np.array([sr, sl, sr+sl, sr-sl])
+        self.ready |= INPUTS_B
+        
+
+    def imageReceivedFallback(self, image):
+       
+
+        image = bridge.imgmsg_to_cv2(image, desired_encoding='bgr8')
+
+        #cv2.imwrite("image.png", image)
+
+        teamtrackers = []
+        kernel = np.ones((2,2))
+        for color_idx in range(3):
+            values = [0]*RESOLUTION
+            lower = np.array([0,0,0]) 
+            upper = np.array([10,10,10])
+            lower[2-color_idx] = 90
+            upper[2-color_idx] = 120
+            mask = cv2.threshold(cv2.inRange(image, lower, upper), 128, 255, cv2.THRESH_BINARY)[1]
+            mask = cv2.erode(mask, kernel)
+            mask = cv2.dilate(mask, kernel)
+            #cv2.imshow("mask"+str(COLORS[color_idx]), mask)
+            mask = mask.sum(axis=0)/255
+            mask[mask<2] = 0
+            for i in range(640):
+                idxsmall = int((i-HALF_SAMPLES)/SAMPLES)
+                p = ((i-HALF_SAMPLES)%SAMPLES)/SAMPLES
+                if idxsmall>=0:
+                    modifier = 0.1+0.9*p
+                    values[idxsmall] += modifier*mask[i]
+                idxbig = idxsmall+1
+                if idxbig<RESOLUTION:
+                    modifier = 0.1+0.9*(1-p)
+                    values[idxbig] += modifier*mask[i]
+            values = np.array(values)/100
+            teamtrackers.append(values)
+        
+        self.inputs[:RESOLUTION] = teamtrackers[(self.team+1)%3] - teamtrackers[(self.team-1)%3]
+        if not (self.ready & CAMERA_B):
+            pass
+        self.ready |= CAMERA_B   
+        
+
+
+    
+    def scanReceivedFallback(self, msg):
+        
+        sensors = [math.inf]*NUM_SENSORS
+        for idx, dist in enumerate(msg.ranges):
+
+            if dist < 0.1 or dist==math.inf:
+                continue
+
+            theta = msg.angle_min + msg.angle_increment * idx
+
+            if theta>math.pi:
+                theta = min(theta - math.pi*2, 0) 
+            
+            if theta>=RANGE_MIN and theta<=RANGE_MAX:
+                idx = int( NUM_SENSORS*(theta-RANGE_MIN)/(RANGE_MAX-RANGE_MIN) )
+
+                sensors[idx] = min(dist, sensors[idx])
+
+
+        jumps = (RANGE_MAX-RANGE_MIN)/(NUM_SENSORS-1)
+        laserscan = LaserScan()
+        laserscan.header = msg.header
+        laserscan.angle_min = RANGE_MIN + jumps/2
+        laserscan.angle_max = RANGE_MAX - jumps/2
+        laserscan.angle_increment = jumps
+        laserscan.ranges = sensors
+        laserscan.range_min = min(sensors)
+        laserscan.range_max = max([s for s in sensors if s<math.inf]or[0])
+        laserscan.intensities = [0]*NUM_SENSORS
+        
+        self.compressed_laser_pub.publish(laserscan)
+
+        sensors = np.array(sensors).clip(max=100)
+        sensors = 10/(sensors+1) 
+        sensors[sensors<=.2] = 0
+
+        self.sensors = sensors
+        
+
+
+    def goalReceivedCallback(self, msg):
+        print('Received new goal on frame id' + msg.header.frame_id)
+        target_frame = self.name + '/odom'
+        try:
+
+            self.goal = self.tf_buffer.transform(msg, target_frame, rospy.Duration(1))
+            self.goal_active = True
+            rospy.logwarn('Setting new goal')
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+            self.goal_active = False
+            rospy.logerr('Could not transform goal from ' + msg.header.frame_id + ' to ' + target_frame + '. Will ignore this goal.')
+
+
+    def driveStraight(self, minumum_speed=0.1, maximum_speed=1.5):
+        goal_copy = copy.deepcopy(self.goal)  # make sure we don't change the stamp field of the goal
+        goal_copy.header.stamp = rospy.Time.now()
+
+        print('Transforming pose')
+        goal_in_base_link = self.tf_buffer.transform(goal_copy, self.name + '/base_footprint', rospy.Duration(1))
+        print('Pose trasnformed')
+
+        x = goal_in_base_link.pose.position.x
+        y = goal_in_base_link.pose.position.y
+
+        self.angle = math.atan2(y,x)
+        distance_to_goal = math.sqrt(x**2 + y**2)
+        if self.sensors[NUM_SENSORS//2]>7:
+            self.speed = -0.1
+            self.angle /= max(self.sensors[NUM_SENSORS//2]*1.5,5)
+        elif abs(self.angle)<math.pi/2:    
+            self.speed = max(minumum_speed, 0.5 * distance_to_goal)   # limit minimum speed
+            self.speed = min(maximum_speed, self.speed)   # limit maximum speed
+        else:
+            self.speed = 0
+
+        if distance_to_goal < 0.1:
+            self.goal_active = False
+
+    def sendCommandCallback(self):
+        print('Sending twist command')        
+        self.driveStraight()
+
+        twist = Twist()
+        twist.linear.x = self.speed
+        twist.angular.z = self.angle
+        self.publisher_command.publish(twist)
+
+
+
+
+
+
+msg = """
+Manual Control Mode for Player
+------------------------------
+
+Moving around:
+
+        w
+   a    s    d
+   
+     [space]
+
+------------------------------
+KEYS:
+    w/s : increase/decrease linear velocity (~ 0.26)
+    a/d : increase/decrease angular velocity (~ 1.82)
+    space key: force stop
+------------------------------
+
+Recording mode:
+
+    i   o   p
+
+------------------------------
+KEYS:
+    i - start recording
+    p - stop recording and discart changes
+    o - stop recording and save changes
+------------------------------
+
+CTRL-C to quit program
+"""
+
+e = """
+ERROR: Communications Failed
+"""
+
+def makeSimpleProfile(output, input, slop):
+    if input > output:
+        output = min( input, output + slop )
+    elif input < output:
+        output = max( input, output - slop )
+    else:
+        output = input
+
+    return output
+
+
+if __name__=="__main__":
+    if os.name != 'nt':
+        settings = termios.tcgetattr(sys.stdin)
+
+    rospy.init_node('manual_mode')
+
+    turtlebot3_model = rospy.get_param("model", "waffle_pi")
+
+    status = 0
+    target_linear_vel   = 0.0
+    target_angular_vel  = 0.0
+    control_linear_vel  = 0.0
+    control_angular_vel = 0.0
+    recording = False
+
+    p = 'red1'
+    myteamidx = max([idx for idx, n in enumerate(COLORS) if p.startswith(n)] or [0])
+
+    driver = ManualDriver(p, myteamidx, Normalizer())
+    lastKey = None 
+    keys_pressed = set()
+
+    perm_history_input = []
+    perm_history_output = []
+    
+    history_input = []
+    history_output = []
+    queue = np.zeros((HISTORY_SIZE * INPUT_SIZE,))
+
+    pub = rospy.Publisher(f"/{driver.name}/cmd_vel", Twist, queue_size=10)
+    try:
+        print(msg)
+        while(1):
+            
+            key_pressed = getKey()
+            keys_pressed.add(key_pressed)
+            if driver.goal_active:
+                driver.sendCommandCallback()
+                continue
+            if (key_pressed == '\x03'):
+                sys.exit(1)
+                break
+            if driver.ready & 0x111:
+                actions = np.array([int(key in keys_pressed) for key in 'wsad '])
+                queue = np.concatenate( [ queue[INPUT_SIZE:] , driver.inputs ] )
+                for key in 'wsad iop':
+                    target_linear_vel *= 0.9
+                    if key not in keys_pressed:
+                        continue
+                    if key == 'w':
+                        target_linear_vel = 1#checkLimitVelocity(target_linear_vel + LIN_VEL_STEP_SIZE, WAFFLE_MAX_LIN_VEL)
+                        print(vels(target_linear_vel,target_angular_vel))
+                    elif key == 's':
+                        target_linear_vel = -1#checkLimitVelocity(target_linear_vel - LIN_VEL_STEP_SIZE, WAFFLE_MAX_LIN_VEL)
+                        print(vels(target_linear_vel,target_angular_vel))
+                    elif key == 'a':
+                        target_angular_vel = checkLimitVelocity(target_angular_vel + ANG_VEL_STEP_SIZE, WAFFLE_MAX_ANG_VEL)
+                        print(vels(target_linear_vel,target_angular_vel))
+                    elif key == 'd':
+                        target_angular_vel = checkLimitVelocity(target_angular_vel - ANG_VEL_STEP_SIZE, WAFFLE_MAX_ANG_VEL)
+                        print(vels(target_linear_vel,target_angular_vel))
+                    elif key == ' ':
+                        target_linear_vel   = 0.0
+                        control_linear_vel  = 0.0
+                        target_angular_vel  = 0.0
+                        control_angular_vel = 0.0
+                        print(vels(target_linear_vel, target_angular_vel))
+                    elif key == 'i': 
+                        # tecla para começar a gravar - insert
+                        rospy.logwarn("Start Recording")
+                        recording = True
+
+                    elif key == 'o':     
+                        # tecla para parar e salvar gravação - end
+                        rospy.logwarn("Stop and Save Recording")
+                        recording = False
+                        perm_history_input.extend(history_input)
+                        perm_history_output.extend(history_output)
+                        np.save("inputs", np.array(perm_history_input), allow_pickle=True)
+                        np.save("outputs", np.array(perm_history_output), allow_pickle=True)
+
+                        history_input = []
+                        history_output = []
+                    elif key == 'p': 
+                        # tecla para parar e descartar gravaçar - delete
+                        rospy.logwarn("Stop and Discart Recording")
+                        recording = False
+                        history_input = []
+                        history_output = []                        
+                    if (key == '\x03'):
+                        break
+                
+                if recording:
+                    history_input.append(queue.astype(np.float32))
+                    history_output.append(actions.astype(np.uint8))
+
+                driver.ready = 0b0
+                keys_pressed = set()                      
+        
+            twist = Twist()
+            control_linear_vel = makeSimpleProfile(control_linear_vel, target_linear_vel, (LIN_VEL_STEP_SIZE/2.0))
+            twist.linear.x = control_linear_vel; twist.linear.y = 0.0; twist.linear.z = 0.0
+
+            control_angular_vel *= 0.95
+            control_angular_vel = makeSimpleProfile(control_angular_vel, target_angular_vel, (ANG_VEL_STEP_SIZE/2.0))
+            twist.angular.x = 0.0; twist.angular.y = 0.0; twist.angular.z = control_angular_vel
+
+            pub.publish(twist)
+
+    except:
+        print(sys.exc_info())
+
+    finally:
+        twist = Twist()
+        twist.linear.x = 0.0; twist.linear.y = 0.0; twist.linear.z = 0.0
+        twist.angular.x = 0.0; twist.angular.y = 0.0; twist.angular.z = 0.0
+        pub.publish(twist)
+
+    if os.name != 'nt':
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)

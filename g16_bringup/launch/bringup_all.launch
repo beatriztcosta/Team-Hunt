@@ -6,27 +6,124 @@
     <include file="$(find g16_bringup)/launch/bringup.launch">
         <arg name="player_name" value="red1"/>
         <arg name="player_color" value="Red"/>
-        <arg name="x_pos" value="2"/>
-        <arg name="y_pos" value="2"/>
+        <arg name="x_pos" value="-2"/>
+        <arg name="y_pos" value="-2"/>
         <arg name="z_pos" value="0"/>
     </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="red2"/>
+        <arg name="player_color" value="Red"/>
+        <arg name="x_pos" value="-2"/>
+        <arg name="y_pos" value="-1"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="red3"/>
+        <arg name="player_color" value="Red"/>
+        <arg name="x_pos" value="-2"/>
+        <arg name="y_pos" value="0"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+   <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="red4"/>
+        <arg name="player_color" value="Red"/>
+        <arg name="x_pos" value="-2"/>
+        <arg name="y_pos" value="1"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="red5"/>
+        <arg name="player_color" value="Red"/>
+        <arg name="x_pos" value="-2"/>
+        <arg name="y_pos" value="2"/>
+        <arg name="z_pos" value="0"/>
+    </include> 
+
 
     <include file="$(find g16_bringup)/launch/bringup.launch">
         <arg name="player_name" value="green1"/>
         <arg name="player_color" value="Green"/>
-        <arg name="x_pos" value="-2"/>
-        <arg name="y_pos" value="2"/>
+        <arg name="x_pos" value="-1"/>
+        <arg name="y_pos" value="-2"/>
         <arg name="z_pos" value="0"/>
     </include>
 
     <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="green2"/>
+        <arg name="player_color" value="Green"/>
+        <arg name="x_pos" value="-1"/>
+        <arg name="y_pos" value="-1"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="green3"/>
+        <arg name="player_color" value="Green"/>
+        <arg name="x_pos" value="-1"/>
+        <arg name="y_pos" value="0"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+     <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="green4"/>
+        <arg name="player_color" value="Green"/>
+        <arg name="x_pos" value="-1"/>
+        <arg name="y_pos" value="1"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+   
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="green5"/>
+        <arg name="player_color" value="Green"/>
+        <arg name="x_pos" value="-1"/>
+        <arg name="y_pos" value="2"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+ 
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
         <arg name="player_name" value="blue1"/>
+        <arg name="player_color" value="Blue"/>
+        <arg name="x_pos" value="0"/>
+        <arg name="y_pos" value="-2"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="blue2"/>
+        <arg name="player_color" value="Blue"/>
+        <arg name="x_pos" value="0"/>
+        <arg name="y_pos" value="-1"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="blue3"/>
         <arg name="player_color" value="Blue"/>
         <arg name="x_pos" value="0"/>
         <arg name="y_pos" value="0"/>
         <arg name="z_pos" value="0"/>
     </include>
 
+     <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="blue4"/>
+        <arg name="player_color" value="Blue"/>
+        <arg name="x_pos" value="0"/>
+        <arg name="y_pos" value="1"/>
+        <arg name="z_pos" value="0"/>
+    </include>
+    
+    <include file="$(find g16_bringup)/launch/bringup.launch">
+        <arg name="player_name" value="blue5"/>
+        <arg name="player_color" value="Blue"/>
+        <arg name="x_pos" value="0"/>
+        <arg name="y_pos" value="2"/>
+        <arg name="z_pos" value="0"/>
+    </include> 
 
     <group if="$(arg visualize)">
         <!--Include do visualize.launch-->

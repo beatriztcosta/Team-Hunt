@@ -8,7 +8,7 @@
     <material>Gazebo/DarkGrey</material>
     <material>Gazebo/${player_color}</material>
     <sensor name="base_link" type="contact">
-      <update_rate>1000.0</update_rate>
+      <update_rate>10.0</update_rate>
       <always_on>true</always_on>
       <contact>
         <collision>base_footprint_fixed_joint_lump__base_link_collision</collision>
@@ -19,6 +19,21 @@
       </plugin>
     </sensor>
   </gazebo>
+
+ <!--  <gazebo reference="camera_link">
+    <sensor name="camera_link" type="contact">
+      <update_rate>1000.0</update_rate>
+      <always_on>true</always_on>
+      <contact>
+        <collision>base_footprint_fixed_joint_lump__camera_link_collision</collision>
+      </contact>
+      <plugin name="camera_link_contact_sensor_plugin" filename="libgazebo_ros_bumper.so">
+        <bumperTopicName>contact</bumperTopicName>
+        <frameName>world</frameName>
+      </plugin>
+    </sensor>
+  </gazebo>
+ -->
 
   <gazebo reference="wheel_left_link">
     <mu1>0.1</mu1>
@@ -123,11 +138,11 @@
   </gazebo>
 
   <gazebo reference="base_scan">
-    <material>Gazebo/FlatBlack</material>
+    <material>Gazebo/${player_color}</material>
     <sensor type="ray" name="lds_lfcd_sensor">
       <pose>0 0 0 0 0 0</pose>
       <visualize>$(arg laser_visual)</visualize>
-      <update_rate>5</update_rate>
+      <update_rate>10.0</update_rate>
       <ray>
         <scan>
           <horizontal>
@@ -161,7 +176,7 @@
       <always_on>true</always_on>
       <visualize>$(arg camera_visual)</visualize>
       <camera>
-          <horizontal_fov>1.4</horizontal_fov>
+          <horizontal_fov>1.35</horizontal_fov>
           <vertical_fov>1.0</vertical_fov>
           <image>
               <width>640</width>
@@ -175,7 +190,7 @@
       </camera>
       <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
         <alwaysOn>true</alwaysOn>
-        <updateRate>30.0</updateRate>
+        <updateRate>10.0</updateRate>
         <cameraName>camera</cameraName>
         <frameName>camera_rgb_optical_frame</frameName>
         <imageTopicName>rgb/image_raw</imageTopicName>

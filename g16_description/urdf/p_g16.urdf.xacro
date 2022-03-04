@@ -202,12 +202,12 @@
   </joint>
 
   <link name="camera_link">
-    <collision>
+    <!-- <collision>
       <origin xyz="0.005 0.011 0.013" rpy="0 0 0"/>
       <geometry>
         <box size="0.015 0.030 0.027"/>
       </geometry>
-    </collision>
+    </collision> -->
   </link>
 
   <joint name="camera_rgb_joint" type="fixed">

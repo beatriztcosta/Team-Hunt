@@ -6,13 +6,72 @@ import rospy
 import tf2_ros
 from geometry_msgs.msg import Twist, PoseStamped
 import tf2_geometry_msgs  # **Do not use geometry_msgs. Use this instead for PoseStamped
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Image, CameraInfo
+from nav_msgs.msg import Odometry
 from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
 
-from rospy import ServiceProxy
+import math, random
+import subprocess
+from colorama import Fore, Back, Style
+from copy import copy
 
-import numpy as np
+import pandas
+from functools import partial
+import rospy
+import tf_conversions  # Because of transformations
+import tf2_ros
+import geometry_msgs.msg
+from gazebo_msgs.msg import ModelState, ModelStates, ContactsState
+from prettytable import PrettyTable
+from rospy import ServiceProxy
+from cv_bridge import CvBridge
 import sys
+import cv2
+import numpy as np
+
+
+# ------------------------
+#   DATA STRUCTURES
+# ------------------------
+from gazebo_msgs.srv import SetModelState
+
+
+COLORS = ['red', 'green', 'blue']
+PLAYERS = [[color+str(j) for j in range(1,4)] for color in COLORS] 
+RGB = [(255,0,0), (0,255,0), (0,0,255)]
+
+
+WAFFLE_MAX_LIN_VEL = 5.26
+WAFFLE_MAX_ANG_VEL = 1.82
+
+WAFFLE_WHEEL_DIST = 0.287
+
+NUM_SENSORS = 11
+RESOLUTION = 7
+
+
+RANGE_MIN = -120*math.pi/180 #-120 degrees
+RANGE_MAX = 120*math.pi/180 #120 degrees
+
+
+SAMPLES = 640/RESOLUTION
+HALF_SAMPLES = SAMPLES/2
+
+
+# binaries
+CAMERA_B, INPUTS_B, LASER_B = 0b001, 0b010, 0b100 
+READY = 0b111
+
+## learning parameters
+# ARS hyperparameters
+DIRECTIONS = 5
+BEST_DIRECTIONS = 16
+NOISE_MIN = 0.02
+NOISE_MAX = 0.04
+LEARNING_RATE = 0.5
+# sizes
+INPUT_SIZE = RESOLUTION + NUM_SENSORS + 2 + 2
+WEIGHT_SIZE = (1, INPUT_SIZE+1)
 
 def delete_model(unique_name):
    
@@ -32,32 +91,714 @@ def delete_model(unique_name):
               (unique_name, resp.status_message), file=sys.stderr)
         return 1 
 
-def main():
-    # ---------------------------------------------------
-    # INITIALIZATION
-    # ---------------------------------------------------
 
-    
-
-    rospy.init_node('p_learner', anonymous=False)
+def deleteAllModels():
     for color in 'red', 'green', 'blue':
-        for i in range(1,4):
-            delete_model(f"{color}{i}")
+        for p in rospy.get_param(f"/{color}_players"):
+            delete_model(p)
+
+
+def bash(cmd, blocking=True, verbose=False):
+    if verbose:
+        print("Executing command: " + cmd)
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if blocking:
+        for line in p.stdout.readlines():
+            print(line)
+            p.wait()
+
+
+def twistToDiff(speed, angular):
+    sl = (2*speed - angular*WAFFLE_WHEEL_DIST)/2
+    sr = angular*WAFFLE_WHEEL_DIST + sl
+    return [sr, sl]
+
+def diffToTwist(sr, sl):
+    return [(sr+sl)/2, (sr-sl)/WAFFLE_WHEEL_DIST]
 
 
 
-    # ---------------------------------------------------
-    # Execution
-    # ---------------------------------------------------
-    # while not rospy.is_shutdown():
-    #
-    #     # create a dog message to sent
+bridge = CvBridge()
 
-    # ---------------------------------------------------
-    # Termination
-    # ---------------------------------------------------
+class MultiBrain():
+    def __init__(self):
+        self.learners = []
+        self.n = 0
+        self.pointer = 0
+        self.currentWeights = np.zeros(WEIGHT_SIZE)
+        self.currentWeights[0,-1] = 0.3
+        self.currentWeights[0, :RESOLUTION] = np.linspace(0.2, -0.2, RESOLUTION)
+        self.currentWeights[0, RESOLUTION+NUM_SENSORS:RESOLUTION+NUM_SENSORS+3] = np.array([-0.0, 0.05, -0.2])
+        #self.currentWeights[0, RESOLUTION:RESOLUTION+NUM_SENSORS] = np.linspace(0.0, 0.1, NUM_SENSORS)
+        #self.currentWeights = np.array([[0.2039244, 0.14529148,0.06503365,0.01212244,-0.06979054,-0.13069589
+        #    ,-0.19038191,-0.01546823,0.00651391,0.00478352,0.01165758,-0.00090158
+        #    , 0.01215455,-0.01241391,-0.0009678,-0.00395642,0.00866256,-0.01193278
+        #    , 0.00490993,0.05815916,-0.17542923,-0.00469125,0.31233682
+        #]])
+        self.currentWeights = np.array([[0.21431054160078758, 0.16167016546095872, 0.07045850832304099, 0.2216216024295199, -0.04101398275982003, -0.14661356993134747, -0.19469888892158788, -0.05280327129006949, 0.029113533602275685, 0.08365593820625683, 0.028318066009373005, -0.020178627757014754, -0.09543855134520472, -0.18230661666626066, -0.10320936072496668, -0.07974540611498637, 0.032630653640017854, 0.030378132808802194, -0.061106268574196855, 0.06754621438402827, -0.18978097900455224, -0.03385914291000995, 0.3080008059517819]])
+    def addLearner(self, learner):
+        self.learners.append( learner )
+        self.n += 1
+        
+        self.rewards = np.zeros((DIRECTIONS*2*self.n,))
+        self.weightNoise = np.zeros((DIRECTIONS*2*self.n,)+WEIGHT_SIZE)
+
+    def update(self, rewards, weightNoise):
+        print("updating!!", self.weightNoise.shape)
+        self.rewards[self.pointer*DIRECTIONS*2:(self.pointer+1)*DIRECTIONS*2] = rewards[:]
+        self.weightNoise[self.pointer*DIRECTIONS*2:(self.pointer+1)*DIRECTIONS*2,:,:] = weightNoise[:,:,:]
+        self.pointer += 1
+
+        if self.pointer==self.n:
+            self.distributeLearning()
+            self.pointer = 0
+            
+    def distributeLearning(self):
+        step = np.zeros(self.currentWeights.shape)
+        best_idxs = [i[1] for i in sorted([(max(self.rewards[idx*2],self.rewards[idx*2+1] ), idx) for idx in range(DIRECTIONS*self.n)],reverse=True)]
+        G = 1
+        sigma = 0
+        for idx in best_idxs:
+            print( self.rewards[idx*2], self.rewards[idx*2+1] )
+            if max(self.rewards[idx*2], self.rewards[idx*2+1])<0:
+                break
+
+            diff = abs(self.rewards[idx*2] - self.rewards[idx*2+1])
+            sigma += diff*G
+            step += self.weightNoise[idx*2,:,:]*(self.rewards[idx*2] - self.rewards[idx*2+1])*G
+            G *= 0.95
+
+        self.currentWeights += LEARNING_RATE / max(sigma, 0.01) * step
+        print(list(self.currentWeights[0,:]))
+        for learner in self.learners:
+            learner.currentWeights[:,:] = self.currentWeights[:,:]
+            learner.generateNoise()
+
+        
+
+class Normalizer():
+
+    def __init__(self):
+        self.n = 0
+        self.min = np.ones(INPUT_SIZE)*1000
+        self.max = np.ones(INPUT_SIZE)*-1000
+
+    def observe(self, x):
+        self.n += 1.
+        self.min = np.minimum(self.min, x)
+        self.max = np.maximum(self.max, x)
+
+    def normalize(self, inputs):
+        return inputs/np.abs(self.max.clip(min=1e-2))
+
+
+def shuffle_along_axis(a, axis):
+    idx = np.random.rand(*a.shape).argsort(axis=axis)
+    return np.take_along_axis(a,idx,axis=axis)
+
+class Driver:
+
+    def __init__(self, name, team, weights, normalizer):
+
+        self.goal = PoseStamped()
+        self.goal_active = False
+        self.team = team
+
+        
+        self.normalizer = normalizer or Normalizer()
+        
+        self.speed = np.zeros((2,1))
+        
+        self.ready = 0b0
+
+        self.inputs = np.zeros((INPUT_SIZE,))
+        self.weights = weights 
+
+        self.name = name #rospy.get_name()
+        print('My player name is ' + self.name)
+
+        self.publisher_command = rospy.Publisher( '/' + self.name + '/cmd_vel', Twist, queue_size=1)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        self.compressed_laser_pub = rospy.Publisher(f"/{name}/compressed_scan", LaserScan, queue_size=10)
+        self.goal_subscriber = rospy.Subscriber('/move_base_simple/goal', PoseStamped, self.goalReceivedCallback)
+        self.laser_subscriber = rospy.Subscriber(f"/{name}/scan", LaserScan, self.scanReceivedFallback)
+        self.camera_subscriber = rospy.Subscriber(f"/{name}/camera/rgb/image_raw", Image, self.imageReceivedFallback)
+        self.odom_subcriber = rospy.Subscriber(f"/{name}/odom", Odometry, self.odomReceivedFallback)
+        self.camera_info = rospy.wait_for_message(f"/{name}/camera/rgb/camera_info", CameraInfo)
+
+    def debug(self, *args):
+        #if self.name=='red1':
+        #    print(*args)
+        pass
+    def odomReceivedFallback(self, event):
+        twist = event.twist.twist
+        #print(twist)
+        sr, sl = twistToDiff(twist.linear.x, twist.angular.z)
+        self.speed = np.array([sr,sl])
+        if not (self.ready & INPUTS_B):
+            pass
+            #print(self.name, "twist: ", twist.linear.x, twist.angular.z)
+            #print(self.name, "sr, sl: ", sr, sl)
+        self.inputs[-4:] =  np.array([sr, sl, sr+sl, sr-sl])
+        self.ready |= INPUTS_B
+        self.act()
+
+    def act(self):
+
+        if not (self.ready & 0x111) or self.name=='red1':
+            return
+        
+        self.normalizer.observe(self.inputs)
+        self.debug("inputs:", self.inputs)
+        I = self.inputs
+        symetric_inputs = np.concatenate( [I[:RESOLUTION][::-1], I[RESOLUTION:RESOLUTION+NUM_SENSORS][::-1], I[-4:-2][::-1], I[-2:-1], -I[-1:] ] )  
+        #print(self.name, "symetric_inputs:", symetric_inputs)
+        compound_inputs_r = np.concatenate([self.normalizer.normalize(self.inputs), np.ones((1,))])
+        compound_inputs_l = np.concatenate([self.normalizer.normalize(symetric_inputs), np.ones((1,))])
+        #print(self.inputs, compound_inputs_r)
+
+        self.ready = 0b0 #reset ready state
+
+        actionr = np.tanh( self.weights.dot(compound_inputs_r) ) * WAFFLE_MAX_LIN_VEL #values between -1 and 1
+        actionl = np.tanh( self.weights.dot(compound_inputs_l) ) * WAFFLE_MAX_LIN_VEL 
+       
+        self.debug("actionr, actionl: ", actionr, actionl)
+        sp_linear, sp_angular = diffToTwist( (actionr[0] + self.speed[0])/2, (actionl[0] + self.speed[1])/2 )
+        self.debug("sp_linear, sp_angular: ", sp_linear, sp_angular)
+        twist = Twist()
+        twist.linear.x = 0#sp_linear
+        twist.angular.z = 0#sp_angular 
+        self.publisher_command.publish(twist)
+
+    def imageReceivedFallback(self, image):
+       
+
+        image = bridge.imgmsg_to_cv2(image, desired_encoding='bgr8')
+
+        #cv2.imwrite("image.png", image)
+
+        lower = np.array([0,0,0]) 
+        upper = np.array([15,15,15]) 
+        cars = cv2.threshold(cv2.inRange(image, lower, upper), 128, 255, cv2.THRESH_BINARY)[1]
+        #cv2.imshow("cars", cars)
+
+        teamtrackers = []
+        kernel = np.ones((2,2))
+        for color_idx in range(3):
+            values = [0]*RESOLUTION
+            lower = np.array([0,0,0]) 
+            upper = np.array([10,10,10])
+            lower[2-color_idx] = 90
+            upper[2-color_idx] = 120
+            mask = cv2.threshold(cv2.inRange(image, lower, upper), 128, 255, cv2.THRESH_BINARY)[1]
+            mask = cv2.erode(mask, kernel)
+            mask = cv2.dilate(mask, kernel)
+            #cv2.imshow("mask"+str(COLORS[color_idx]), mask)
+            mask = mask.sum(axis=0)/255
+            mask[mask<2] = 0
+            for i in range(640):
+                idxsmall = int((i-HALF_SAMPLES)/SAMPLES)
+                p = ((i-HALF_SAMPLES)%SAMPLES)/SAMPLES
+                if idxsmall>=0:
+                    modifier = 0.1+0.9*p
+                    values[idxsmall] += modifier*mask[i]
+                idxbig = idxsmall+1
+                if idxbig<RESOLUTION:
+                    modifier = 0.1+0.9*(1-p)
+                    values[idxbig] += modifier*mask[i]
+            values = np.array(values)/100
+            teamtrackers.append(values)
+        
+        #cv2.waitKey(2)
+        
+        self.debug(teamtrackers[(self.team+1)%3] - teamtrackers[(self.team-1)%3])
+        self.inputs[:RESOLUTION] = teamtrackers[(self.team+1)%3] - teamtrackers[(self.team-1)%3]#, teamtrackers[self.team]], axis=0)
+        if not (self.ready & CAMERA_B):
+            #print(self.name, self.inputs[:RESOLUTION])
+            pass
+        self.ready |= CAMERA_B  
+        self.act()
+
+
+    def scanReceivedFallback(self, msg):
+        
+        
+        sensors = [math.inf]*NUM_SENSORS
+        for idx, dist in enumerate(msg.ranges):
+
+            if dist < 0.1 or dist==math.inf:
+                continue
+
+            theta = msg.angle_min + msg.angle_increment * idx
+
+            if theta>math.pi:
+                theta = min(theta - math.pi*2, 0) 
+            
+            if theta>=RANGE_MIN and theta<=RANGE_MAX:
+                idx = int( NUM_SENSORS*(theta-RANGE_MIN)/(RANGE_MAX-RANGE_MIN) )
+
+                sensors[idx] = min(dist, sensors[idx])
+
+        if self.name=="red1":
+            jumps = (RANGE_MAX-RANGE_MIN)/(NUM_SENSORS-1)
+            laserscan = LaserScan()
+            laserscan.header = msg.header
+            laserscan.angle_min = RANGE_MIN + jumps/2
+            laserscan.angle_max = RANGE_MAX - jumps/2
+            laserscan.angle_increment = jumps
+            laserscan.ranges = sensors
+            laserscan.range_min = min(sensors)
+            laserscan.range_max = max([s for s in sensors if s<math.inf]or[0])
+            laserscan.intensities = [0]*NUM_SENSORS
+            
+            self.compressed_laser_pub.publish(laserscan)
+
+        sensors = np.array(sensors).clip(max=100)
+        sensors = 10/(sensors+1) 
+        sensors[sensors<=.2] = 0
+
+        self.sensors = sensors
+        
+        
+        self.inputs[RESOLUTION:RESOLUTION+NUM_SENSORS] = sensors
+        self.ready |= LASER_B
+        self.act()
+
+
+    def goalReceivedCallback(self, msg):
+        # TODO verify is goal is on odom frame
+        print('Received new goal on frame id' + msg.header.frame_id)
+        target_frame = self.name + '/odom'
+        try:
+
+            self.goal = self.tf_buffer.transform(msg, target_frame, rospy.Duration(1))
+            self.goal_active = True
+            rospy.logwarn('Setting new goal')
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+            goal_active = False
+            rospy.logerr('Could not transform goal from ' + msg.header.frame_id + ' to ' + target_frame + '. Will ignore this goal.')
+
+        # print('Received new goal')
+        # self.goal = copy.copy(msg)  # store goal
+        # self.goal = copy.copy(msg)  # store goal
+        # self.goal_active = True
+
+class Learner(Driver):
+    def __init__(self, name, team, weights, normalizer, brain=None):
+        if weights:
+            self.currentWeights = weights
+        else:
+            self.currentWeights = np.zeros(WEIGHT_SIZE)
+            #self.currentWeights[0,-1] = 0.5
+            #self.currentWeights[0, :RESOLUTION] = np.linspace(0.5, 0.0, RESOLUTION)
+            #self.currentWeights[0, RESOLUTION:RESOLUTION+NUM_SENSORS] = np.linspace(0.0, 0.5, NUM_SENSORS)
+
+        if brain:
+            brain.addLearner(self)
+            self.currentWeights[:,:] = brain.currentWeights[:,:]
+
+        self.name = name
+        self.brain = brain
+        self.rewards = np.zeros((DIRECTIONS*2,))
+        self.weightNoise = np.zeros((DIRECTIONS*2,)+WEIGHT_SIZE)
+        self.currentIdx = 0
+        self.generateNoise()
+        super().__init__(name, team, self.currentWeights + self.weightNoise[0, :, :], normalizer)
+
+
+
+    def endEpisode(self, reward):
+        self.rewards[self.currentIdx] = reward
+
+        self.currentIdx += 1
+        if self.currentIdx >= DIRECTIONS*2:
+            self.currentIdx = 0
+            self.update()
+        else:
+            self.weights = self.currentWeights + self.weightNoise[self.currentIdx, :, :]
+
+
+    def update(self):
+        if self.brain:
+            self.brain.update(self.rewards, self.weightNoise)
+            return
+
+        step = np.zeros(self.currentWeights.shape)
+        best_idxs = [i[1] for i in sorted([(max(self.rewards[idx*2],self.rewards[idx*2+1] ), idx) for idx in range(DIRECTIONS)],reverse=True)]
+        G = 1
+        sigma = 0
+        print("rewards:", self.name)
+        for idx in best_idxs:
+            print( self.rewards[idx*2], self.rewards[idx*2+1] )
+            if max(self.rewards[idx*2] - self.rewards[idx*2+1])<0:
+                break
+            diff = abs(self.rewards[idx*2] - self.rewards[idx*2+1])
+            sigma += diff*G
+            step += self.weightNoise[idx*2,:,:]*(self.rewards[idx*2] - self.rewards[idx*2+1])*G
+            G*=0.95
+
+        print(f"BEFORE {self.name}: ", self.currentWeights)
+        self.currentWeights += LEARNING_RATE / max(sigma, 0.01) * step
+        print(f"AFTER {self.name}: ", self.currentWeights)
+
+        self.generateNoise()
+        
+    def generateNoise(self):
+        self.currentIdx = 0
+        noise = np.random.randn(DIRECTIONS, *self.weightNoise.shape[1:])
+
+        noiseAmplify = np.linspace(NOISE_MIN, NOISE_MAX, DIRECTIONS)
+        np.random.shuffle(noiseAmplify)
+
+        for d in range(DIRECTIONS):
+            self.weightNoise[d*2,:,:] = noise[d,:,:]*noiseAmplify[d]
+            self.weightNoise[d*2+1,:,:] = -noise[d,:,:]*noiseAmplify[d]
+
+        self.debug(self.weightNoise)
+        self.weights = self.currentWeights + self.weightNoise[self.currentIdx, :, :]
+  
+
+class Referee:
+
+    def __init__(self, learners):
+
+        # Verify that all the required parameters exist
+        self.game_over = True
+        self.learners = learners
+        self.locations = [(x+0.5,y+0.5) for x in range(1,8) for y in range(-3,3)]
+        self.locationidx = 0
+        try:
+            existing_params = rospy.get_param_names()
+        except rospy.ROSException:
+            print("Could not get param name")
+
+        required_params = ['/killed_duration', '/game_duration', '/positive_score', '/negative_score', '/best_hunter_score',
+                           '/best_survivor_score', '/red_players', '/green_players', '/blue_players']
+        
+        for required_param in required_params:
+            if not required_param in existing_params:
+                raise ValueError('Required ros parameter ' + required_param +
+                                 ' does not exist. Are you sure you load the game params.yaml?')
+
+        self.params = {'killed_duration': rospy.get_param('/killed_duration'),
+                       'game_duration': rospy.get_param('/game_duration'),
+                       'positive_score': rospy.get_param('/positive_score'),
+                       'immunity_duration': rospy.get_param('/immunity_duration'),
+                       'negative_score': rospy.get_param('/negative_score'),
+                       'best_hunter_score': rospy.get_param('/best_hunter_score'),
+                       'best_survivor_score': rospy.get_param('/best_survivor_score'),
+                       'red': rospy.get_param('/red_players'),
+                       'green': rospy.get_param('/green_players'),
+                       'blue': rospy.get_param('/blue_players')}
+
+        # Create a dictionary so we can retrieve the players of a team using the team color
+        self.score = {'red': 0, 'green': 0, 'blue': 0}
+        self.final_score = {'red': 0, 'green': 0, 'blue': 0}
+
+        rospy.wait_for_service('/gazebo/set_model_state')  # check that this service exists
+
+       
+        rospy.sleep(0.1)
+
+        # Create an instance for each player
+        self.players = {}
+        count = 1
+        for player in self.params['red']:
+            self.players[player] = PlayerInfo(player, self.params, my_team='red', prey_team='green', hunter_team='blue',
+                                              callbackHuntedEvent=self.callbackHuntedEvent, killPlayer=self.killPlayer, number=count)
+            count += 1
+        for player in self.params['green']:
+            self.players[player] = PlayerInfo(player, self.params, my_team='green', prey_team='blue', hunter_team='red',
+                                              callbackHuntedEvent=self.callbackHuntedEvent, killPlayer=self.killPlayer, number=count)
+            count += 1
+        for player in self.params['blue']:
+            self.players[player] = PlayerInfo(player, self.params, my_team='blue', prey_team='red', hunter_team='green',
+                                              callbackHuntedEvent=self.callbackHuntedEvent, killPlayer=self.killPlayer, number=count)
+            count += 1
+
+        self.game_start_tic = rospy.Time.now()
+        self.timer_check_game = rospy.Timer(rospy.Duration(0.1), self.callbackCheckGame, oneshot=False)
+        self.timer_end_game = rospy.Timer(rospy.Duration(self.params['game_duration']), self.callbackEndGame,
+                                          oneshot=False)
+
+        for color in 'red', 'green', 'blue':
+            for p in rospy.get_param(f"/{color}_players"):
+                self.movePlayerToArena(p)
+
+        
+        self.game_over = False
+
+    def callbackEndGame(self, event):
+
+        self.game_over = True
+
+        # Print scoreboard
+        self.printScores()
+
+        # Game over message
+        if self.final_score['red'] == self.final_score['green'] and self.final_score['red'] == self.final_score['blue']:
+            print(Style.BRIGHT + 'Game Over! It is a tie!!!')
+        elif self.final_score['red'] > max(self.final_score['green'], self.final_score['blue']):
+            print(Style.BRIGHT + 'Game Over! Team ' + Fore.RED + 'Red' + Fore.RESET + ' wins!!!')
+        elif self.final_score['green'] > max(self.final_score['red'], self.final_score['blue']):
+            print(Style.BRIGHT + 'Game Over! Team ' + Fore.GREEN + 'Green' + Fore.RESET + ' wins!!!')
+        elif self.final_score['blue'] > max(self.final_score['green'], self.final_score['red']):
+            print(Style.BRIGHT + 'Game Over! Team ' + Fore.BLUE + 'Blue' + Fore.RESET + ' wins!!!')
+        
+
+        for learner in self.learners:
+            learner.endEpisode( self.players[learner.name].score )
+            #self.movePlayerToArena(learner.name)
+        rospy.sleep(0.2)
+        for learner in self.learners:
+            self.players[learner.name].reset()
+        
+        self.score = {'red': 0, 'green': 0, 'blue': 0}
+        self.final_score = {'red': 0, 'green': 0, 'blue': 0}
+
+        self.game_over = False
+        
+        
+        #rospy.signal_shutdown('Game finished')
+
+    def printScores(self):
+        best_hunter, best_survivor = self.getBestHunterAndSurvivor()
+
+        print(Style.BRIGHT + '\nPlayer by player scores:' + Style.RESET_ALL)
+        table = PrettyTable(
+            [Back.LIGHTWHITE_EX + "Player", "Team", "#Hunted", "#Preyed", "Killed", "Spawn" + Style.RESET_ALL])
+
+        for player in self.players.values():
+            num_hunted, num_preyed = str(player.num_hunted), str(player.num_preyed)
+            if player.name == best_hunter:
+                num_hunted = Back.LIGHTCYAN_EX + str(player.num_hunted) + Style.RESET_ALL
+            elif player.name == best_survivor:
+                num_preyed = Back.MAGENTA + str(player.num_preyed) + Style.RESET_ALL
+
+            time_to_spawn = self.params['killed_duration'] - (rospy.Time.now() - player.stamp_killed).to_sec()
+
+            if time_to_spawn < 0:
+                time_to_spawn = '---'
+            else:
+                time_to_spawn = "{:.1f}".format(time_to_spawn)
+            table.add_row([player.colorama_color + player.name + Fore.RESET,
+                           player.colorama_color + player.my_team + Fore.RESET,
+                           num_hunted, num_preyed, player.killed, time_to_spawn])
+
+        table.align = 'c'
+        table.align[Back.LIGHTWHITE_EX + "Player"] = 'l'
+        table.align['Team'] = 'l'
+        print(table)
+
+        print('Best hunter: ' + Fore.LIGHTCYAN_EX + str(best_hunter) + Style.RESET_ALL +
+              ' Best survivor: ' + Fore.MAGENTA + str(best_survivor) + Style.RESET_ALL)
+
+        self.score = {team: sum(self.players[p].score for p in self.params[team]) for team in ['red','green','blue']}
+        print(Style.BRIGHT + '\nTeam scores:' + Style.RESET_ALL)
+        table = PrettyTable([Back.LIGHTWHITE_EX + "Team", "Raw Score", "Final Score" + Style.RESET_ALL])
+        for team_key, score in self.score.items():
+            self.final_score[team_key] = score
+            if best_hunter in self.params[team_key]:
+                self.final_score[team_key] += self.params['best_hunter_score']
+            if best_survivor in self.params[team_key]:
+                self.final_score[team_key] += self.params['best_survivor_score']
+            table.add_row([getattr(Fore, team_key.upper()) + team_key + Style.RESET_ALL, str(score),
+                           str(self.final_score[team_key])])
+
+        print(table)
+        game_time = "{:.1f}".format((rospy.Time.now() - self.game_start_tic).to_sec())
+        print('Game time: ' + game_time + ' out of ' + str(self.params['game_duration']))
+
+    def getBestHunterAndSurvivor(self):
+
+        ps = [(player, self.players[player].num_hunted, self.players[player].num_preyed) for player in
+              self.players.keys()]
+        hunt_values = [self.players[player].num_hunted for player in self.players.keys()]
+        prey_values = [self.players[player].num_preyed for player in self.players.keys()]
+
+        best_hunter, maximum_num_hunts, _ = max(ps, key=lambda item: item[1])
+        if hunt_values.count(maximum_num_hunts) > 1:
+            best_hunter = None
+
+        best_survivor, _, minimum_num_preyed = min(ps, key=lambda item: item[2])
+        if prey_values.count(minimum_num_preyed) > 1:
+            best_survivor = None
+
+        # print('best hunter is ' + str(best_hunter))
+        # print('best survivor is ' + str(best_survivor))
+        return best_hunter, best_survivor
+
+    def callbackCheckGame(self, event):
+        if self.game_over:
+            return
+
+        # reward for speed
+        now = rospy.Time.now()
+        for learner in self.learners:
+            player = self.players[learner.name]
+            #print(player.killed, learner.inputs[-2])
+            if not player.killed:
+                player.score += max(0, abs(learner.speed.sum()) )/30.0
+            elif (now - player.stamp_killed).to_sec() > self.params['killed_duration']:
+                player.stamp_resuscitated = rospy.Time.now()
+                self.movePlayerToArena(learner.name)
+                rospy.logwarn("Resuscitating %s", learner.name)
+
+
+                
+        # Print scoreboard
+        #self.printScores()
+
+    def callbackHuntedEvent(self, hunter, prey):
+        if self.game_over:
+            return
+
+        if not self.players[prey].killed:
+            rospy.logwarn(hunter + ' hunted ' + prey)
+            self.killPlayer(prey)
+            now = rospy.Time.now()
+            if (now - self.players[prey].stamp_resuscitated).to_sec() <= self.params['immunity_duration']:
+                rospy.logwarn(f"{prey} is immune")
+                return
+            if (now - self.players[hunter].stamp_resuscitated).to_sec() <= self.params['immunity_duration']:
+                rospy.logwarn(f"{hunter} (hunter) is immune")
+                return
+            self.players[hunter].num_hunted += 1
+            self.players[prey].num_preyed += 1
+            #self.score[self.players[hunter].my_team] += self.params['positive_score']
+            self.players[hunter].score += self.params['positive_score']
+            self.players[prey].score += self.params['negative_score']
+            #self.score[self.players[prey].my_team] += self.params['negative_score']
+
+    def killPlayer(self, name, modify_score=0):
+        self.players[name].killed = True
+        self.players[name].score += modify_score
+        self.players[name].stamp_killed = rospy.Time.now()
+        self.removePlayerFromArena(name)
+
+    def removePlayerFromArena(self, name):
+        # Arena limbo area has following dimensions:
+        # x from -1.5 to 1.5
+        # y from 3.5 to 7
+        x = random.random() * 3 - 1.5
+        y = random.random() * 3.5 + 3.5
+        self.warpPlayer(name, x, y, 0)
+
+    def movePlayerToArena(self, name):
+        # Arena area has following dimensions:
+        # x from -8 to 8
+        # y from -2.5 to 2.5
+        x,y = self.locations[self.locationidx]
+        self.locationidx = (self.locationidx+1)%len(self.locations)
+        self.players[name].killed = False
+        self.warpPlayer(name, x, y, random.random() * math.pi * 2 - math.pi)
+
+    def warpPlayer(self, name, x, y, yaw):
+        state_msg = ModelState()
+        state_msg.model_name = name
+        state_msg.pose.position.x = x
+        state_msg.pose.position.y = y
+        quaternion = tf_conversions.tf.transformations.quaternion_from_euler(0, 0, yaw)
+        state_msg.pose.orientation.x = quaternion[0]
+        state_msg.pose.orientation.y = quaternion[1]
+        state_msg.pose.orientation.z = quaternion[2]
+        state_msg.pose.orientation.w = quaternion[3]
+
+        try:
+            set_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+            resp = set_state(state_msg)
+        except rospy.ServiceException as e:
+            print("Service call failed:" + str(e))
+
+
+class PlayerInfo:
+
+    def __init__(self, name, players, my_team, prey_team, hunter_team, callbackHuntedEvent, killPlayer, number=1):
+        self.name = name
+        self.number = number
+        self.players = players
+        self.colorama_color = getattr(Fore, my_team.upper())
+        self.my_team, self.prey_team, self.hunter_team = my_team, prey_team, hunter_team
+       
+
+
+        print('Referee configuring ' + self.name + ', from team ' + self.my_team + ', hunting ' + str(
+            self.players[self.prey_team]) + ' and fleeing from ' + str(self.players[self.hunter_team]))
+
+        self.callbackHuntedEvent = callbackHuntedEvent
+        self.killPlayer = killPlayer
+
+        self.killed = False
+        self.stamp_resuscitated = rospy.Time.now()
+        self.stamp_killed = rospy.Time.now() - rospy.Duration.from_sec(10)        
+
+        self.subscriber_contact = rospy.Subscriber('/' + self.name + '/contact', ContactsState,
+                                                   self.callbackContactReceived)
+
+        self.reset()
+        print(self.__str__())  # print a report after initialization
+
+    def reset(self):
+        self.score = 0
+        #self.killed = False
+        #self.stamp_resuscitated = rospy.Time.now()
+        #self.stamp_killed = rospy.Time.now() - rospy.Duration.from_sec(10)
+        self.num_hunted = 0
+        self.num_preyed = 0
+
+    def callbackContactReceived(self, msg):
+        # print(self.colorama_color + self.name + Style.RESET_ALL + ': contact message received')
+        now = rospy.Time.now()
+        for state in msg.states:
+
+            if state.collision2_name.split('::')[0] == self.name:
+                state.collision1_name, state.collision2_name = state.collision2_name, state.collision1_name
+
+            object1, collision_obj1, _ = state.collision1_name.split('::')
+            object2, collision_obj2, _ = state.collision2_name.split('::')
+            if object1 != self.name or self.killed: continue
+
+            if object2 in self.players[self.prey_team]:
+                self.callbackHuntedEvent(self.name, object2)
+           
+            elif collision_obj2.startswith("Wall") or object2 in self.players[self.my_team]: #:
+                if (now - self.stamp_resuscitated).to_sec() > 2 and collision_obj2.startswith("Wall"): #immunity diration
+                    rospy.logwarn(self.name + ' bumped into a wall ')
+                    self.killPlayer(self.name, -2)
+                else:
+                    rospy.logwarn(self.name + ' bumped into a wall while immune')
+                    self.killPlayer(self.name, 0)
+
+    def __str__(self):
+        s = 'Player ' + self.colorama_color + self.name + Style.RESET_ALL + ' (team ' + self.my_team + ')\t'
+        s += 'Hunted: ' + str(self.num_hunted) + ' ; Preyed: ' + str(self.num_preyed)
+        return s
+
+
+# ------------------------
+# GLOBAL VARIABLES
+# ------------------------
+
+def main():
+    rospy.init_node('p_learner', anonymous=True)  # initialize the ros node
+    #deleteAllModels()
+    #return
+    normalizer = Normalizer()
+    rospy.sleep(0.5)  # make sure the rospy time works
+    learners = []
+    brain = MultiBrain() # {team: MultiBrain() for team in ['red', 'green', 'blue']}
+    for color in 'red', 'green', 'blue':
+        for p in rospy.get_param(f"/{color}_players"):
+            myteamidx = max([idx for idx, n in enumerate(COLORS) if p.startswith(n)] or [0])
+            learners.append( Learner(p, myteamidx, None, normalizer, brain) )
+            #delete_model(p)
+    referee = Referee(learners)
+
+    rospy.spin()
 
 
 if __name__ == '__main__':
     main()
-
