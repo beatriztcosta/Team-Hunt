@@ -20,3 +20,10 @@ Parâmetros de avaliação:
 - Demonstração do jogo 
 - Extras 
 - Repositório Github
+
+
+
+[Vídeo team hunt](https://youtu.be/a2rEA_lOTcg "G16 PSR 2022")
+
+
+
